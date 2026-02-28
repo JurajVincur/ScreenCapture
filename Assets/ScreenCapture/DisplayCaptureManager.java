@@ -3,8 +3,10 @@ package com.pupillabs.screencapture;
 import static android.content.ContentValues.TAG;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.PixelFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.display.DisplayManager;
@@ -76,6 +78,7 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
 
     private UnityInterface unityInterface;
     private IUnityFrameListener frameListener = null;
+    private BroadcastReceiver screenStateReceiver;
 
     private record UnityInterface(String gameObjectName) {
 
@@ -93,6 +96,14 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
 
         public void OnCaptureStopped() {
             Call("OnCaptureStopped");
+        }
+
+        public void OnScreenOff() {
+            Call("OnScreenOff");
+        }
+
+        public void OnScreenOn() {
+            Call("OnScreenOn");
         }
     }
 
@@ -119,6 +130,8 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
                 UnityPlayer.currentContext,
                 DisplayCaptureNotificationService.class);
         UnityPlayer.currentContext.startService(notifServiceIntent);
+
+        registerScreenStateReceiver();
 
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
 
@@ -177,6 +190,42 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
         }, 100);
 
         Log.i(TAG, "Screen capture started!");
+    }
+
+    private void registerScreenStateReceiver() {
+        if (screenStateReceiver == null) {
+            screenStateReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
+                        Log.i(TAG, "Screen turned off! Notifying Unity...");
+                        if (unityInterface != null) {
+                            unityInterface.OnScreenOff();
+                        }
+                    } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
+                        Log.i(TAG, "Screen turned on! Notifying Unity...");
+                        if (unityInterface != null) {
+                            unityInterface.OnScreenOn();
+                        }
+                    }
+                }
+            };
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_SCREEN_OFF);
+            filter.addAction(Intent.ACTION_SCREEN_ON); // <-- Listen for Screen On
+            UnityPlayer.currentContext.registerReceiver(screenStateReceiver, filter);
+        }
+    }
+
+    private void unregisterScreenStateReceiver() {
+        if (screenStateReceiver != null) {
+            try {
+                UnityPlayer.currentContext.unregisterReceiver(screenStateReceiver);
+            } catch (IllegalArgumentException e) {
+                // Ignore: Receiver wasn't registered
+            }
+            screenStateReceiver = null;
+        }
     }
 
     @Override
@@ -319,6 +368,8 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
     }
 
     private void handleScreenCaptureEnd() {
+
+        unregisterScreenStateReceiver();
 
         if (virtualDisplay != null) {
             virtualDisplay.release();

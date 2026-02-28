@@ -45,6 +45,9 @@ namespace PupilLabs.ScreenCapture
         private volatile bool newFrameReceived = false;
         private readonly object frameLock = new object();
 
+        private bool captureActive = false;
+        private bool restartCapture = false;
+
         public bool RecordVideo { get { return recordVideo; } set { recordVideo = value; } }
 
         private class AndroidInterface : IDisposable
@@ -139,15 +142,35 @@ namespace PupilLabs.ScreenCapture
 
         public void StartScreenCapture()
         {
+            captureActive = true;
             androidInterface.RequestCapture(recordVideo);
         }
 
         public void StopScreenCapture()
         {
+            captureActive = false;
             androidInterface.StopCapture();
         }
 
         // Messages sent from Android
+
+        private void OnScreenOff()
+        {
+            if (captureActive)
+            {
+                restartCapture = true;
+                StopScreenCapture();
+            }
+        }
+
+        private void OnScreenOn()
+        {
+            if (restartCapture)
+            {
+                restartCapture = false;
+                StartScreenCapture();
+            }
+        }
 
 #pragma warning disable IDE0051 // Remove unused private members
         private unsafe void OnCaptureStarted()
