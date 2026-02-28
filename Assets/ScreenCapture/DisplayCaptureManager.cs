@@ -44,6 +44,8 @@ namespace PupilLabs.ScreenCapture
         private int bufferSize;
         private volatile bool newFrameReceived = false;
         private readonly object frameLock = new object();
+        private bool shouldBeCapturing;
+        private bool isCapturing;
 
         public bool RecordVideo { get { return recordVideo; } set { recordVideo = value; } }
 
@@ -139,11 +141,13 @@ namespace PupilLabs.ScreenCapture
 
         public void StartScreenCapture()
         {
+            shouldBeCapturing = true;
             androidInterface.RequestCapture(recordVideo);
         }
 
         public void StopScreenCapture()
         {
+            shouldBeCapturing = false;
             androidInterface.StopCapture();
         }
 
@@ -152,6 +156,7 @@ namespace PupilLabs.ScreenCapture
 #pragma warning disable IDE0051 // Remove unused private members
         private unsafe void OnCaptureStarted()
         {
+            isCapturing = true;
             onStarted.Invoke();
             imageData = androidInterface.GetByteBuffer();
         }
@@ -231,7 +236,16 @@ namespace PupilLabs.ScreenCapture
 
         private void OnCaptureStopped()
         {
+            isCapturing = false;
             onStopped.Invoke();
+        }
+
+        private void OnApplicationPause(bool pauseStatus)
+        {
+            if (!pauseStatus && shouldBeCapturing && !isCapturing)
+            {
+                StartScreenCapture();
+            }
         }
 #pragma warning restore IDE0051 // Remove unused private members
 

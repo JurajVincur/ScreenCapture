@@ -27,6 +27,7 @@ import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Build;
 import android.os.Looper;
 import android.util.Log;
 import android.view.Surface;
@@ -39,6 +40,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class DisplayCaptureManager implements ImageReader.OnImageAvailableListener {
 
@@ -46,8 +49,12 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
 
     private ImageReader reader;
     private MediaProjection projection;
+    private MediaProjection.Callback projectionCallback;
     private VirtualDisplay virtualDisplay;
     private Intent notifServiceIntent;
+    private boolean isNotifServiceStarted = false;
+    private boolean isStartingCapture = false;
+    private boolean isPermissionRequestInFlight = false;
 
     private MediaRecorder mediaRecorder;
     private String videoFilePath;
@@ -108,17 +115,47 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
     }
 
     public void onPermissionResponse(int resultCode, Intent intent) {
+        isPermissionRequestInFlight = false;
 
         if (resultCode != Activity.RESULT_OK) {
+            isStartingCapture = false;
             unityInterface.OnPermissionDenied();
             Log.i(TAG, "Screen capture permission denied!");
             return;
         }
 
-        notifServiceIntent = new Intent(
-                UnityPlayer.currentContext,
-                DisplayCaptureNotificationService.class);
-        UnityPlayer.currentContext.startService(notifServiceIntent);
+        var projectionManager = (MediaProjectionManager)
+                UnityPlayer.currentContext.getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+        projection = projectionManager.getMediaProjection(resultCode, intent);
+
+        startCaptureWithProjection();
+    }
+
+    private void startCaptureWithProjection() {
+
+        if (projection == null) {
+            Log.e(TAG, "Cannot start capture: MediaProjection is null.");
+            isStartingCapture = false;
+            return;
+        }
+
+        // Always teardown stale resources before a fresh start attempt.
+        releaseCaptureResources(false, false);
+
+        if (projectionCallback != null) {
+            projection.unregisterCallback(projectionCallback);
+        }
+        projectionCallback = new MediaProjection.Callback() {
+            @Override
+            public void onStop() {
+                Log.i(TAG, "Screen capture ended!");
+                projection = null;
+                releaseCaptureResources(true, true);
+            }
+        };
+        projection.registerCallback(projectionCallback, new Handler(Looper.getMainLooper()));
+
+        ensureNotificationServiceStarted();
 
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
 
@@ -132,8 +169,8 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             // --- NEW: Setup MediaCodec ---
             setupMediaCodec();
 
-            // 2. Setup the OpenGL Surface Splitter (Now taking 3 surfaces)
-            surfaceSplitter = new SurfaceSplitter(
+                // 2. Setup the OpenGL Surface Splitter (Now taking 3 surfaces)
+                surfaceSplitter = new SurfaceSplitter(
                     reader.getSurface(), 
                     mediaRecorder != null ? mediaRecorder.getSurface() : null,
                     mediaCodecSurface, // <--- ADDED 3rd output
@@ -142,19 +179,6 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             );
 
             surfaceSplitter.setup(inputSurface -> {
-                // Callback fires when EGL is ready. Now create the Projection and VirtualDisplay.
-                var projectionManager = (MediaProjectionManager)
-                        UnityPlayer.currentContext.getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-                projection = projectionManager.getMediaProjection(resultCode, intent);
-
-                projection.registerCallback(new MediaProjection.Callback() {
-                    @Override
-                    public void onStop() {
-                        Log.i(TAG, "Screen capture ended!");
-                        handleScreenCaptureEnd();
-                    }
-                }, new Handler(Looper.getMainLooper()));
-
                 // 3. Create a SINGLE VirtualDisplay pointing to the OpenGL input surface
                 virtualDisplay = projection.createVirtualDisplay("ScreenCapture",
                         width, height, 300,
@@ -172,6 +196,7 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
                 }
 
                 unityInterface.OnCaptureStarted();
+                isStartingCapture = false;
             });
 
         }, 100);
@@ -318,7 +343,8 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
         }
     }
 
-    private void handleScreenCaptureEnd() {
+    private void releaseCaptureResources(boolean stopProjection, boolean notifyStop) {
+
 
         if (virtualDisplay != null) {
             virtualDisplay.release();
@@ -330,16 +356,23 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             surfaceSplitter = null;
         }
 
-        if (isRecording && mediaRecorder != null) {
+        if (mediaRecorder != null) {
             try {
-                mediaRecorder.stop();
-                mediaRecorder.reset();
-                mediaRecorder.release();
-                mediaRecorder = null;
-                isRecording = false;
-                Log.i(TAG, "Recording successfully saved to: " + videoFilePath);
+                if (isRecording) {
+                    mediaRecorder.stop();
+                    Log.i(TAG, "Recording successfully saved to: " + videoFilePath);
+                }
             } catch (RuntimeException stopException) {
                 Log.e(TAG, "Failed to stop MediaRecorder cleanly", stopException);
+            } finally {
+                try {
+                    mediaRecorder.reset();
+                } catch (Exception ignored) { }
+                try {
+                    mediaRecorder.release();
+                } catch (Exception ignored) { }
+                mediaRecorder = null;
+                isRecording = false;
             }
         }
         
@@ -361,8 +394,25 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             codecHandler = null;
         }
 
-        UnityPlayer.currentContext.stopService(notifServiceIntent);
-        unityInterface.OnCaptureStopped();
+        if (stopProjection && projection != null) {
+            if (projectionCallback != null) {
+                projection.unregisterCallback(projectionCallback);
+                projectionCallback = null;
+            }
+            projection.stop();
+            projection = null;
+        } else if (projection == null) {
+            projectionCallback = null;
+        }
+
+        if (stopProjection) {
+            stopNotificationService();
+        }
+
+        if (notifyStop) {
+            isStartingCapture = false;
+            unityInterface.OnCaptureStopped();
+        }
     }
 
     // Called by Unity
@@ -386,8 +436,27 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
 
     public void requestCapture(boolean recordVideo) {
         this.shouldRecordVideo = recordVideo;
+
+        if (virtualDisplay != null || isStartingCapture) {
+            Log.i(TAG, "Screen capture is already running.");
+            return;
+        }
+
+        if (isPermissionRequestInFlight) {
+            Log.i(TAG, "Screen capture permission request already in flight.");
+            return;
+        }
+
+        if (projection != null) {
+            Log.i(TAG, "Resuming capture using active MediaProjection instance.");
+            isStartingCapture = true;
+            startCaptureWithProjection();
+            return;
+        }
         
         Log.i(TAG, "Asking for screen capture permission...");
+        isStartingCapture = true;
+        isPermissionRequestInFlight = true;
         Intent intent = new Intent(
                 UnityPlayer.currentActivity,
                 DisplayCaptureRequestActivity.class);
@@ -396,9 +465,49 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
 
     public void stopCapture() {
         Log.i(TAG, "Stopping screen capture...");
+        isPermissionRequestInFlight = false;
+        isStartingCapture = false;
 
-        if(projection == null) return;
-        projection.stop();
+        if (projection != null) {
+            if (projectionCallback != null) {
+                projection.unregisterCallback(projectionCallback);
+                projectionCallback = null;
+            }
+            projection.stop();
+            projection = null;
+        }
+
+        releaseCaptureResources(true, true);
+    }
+
+    private void ensureNotificationServiceStarted() {
+        if (isNotifServiceStarted) {
+            return;
+        }
+
+        notifServiceIntent = new Intent(
+                UnityPlayer.currentContext,
+                DisplayCaptureNotificationService.class);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            UnityPlayer.currentContext.startForegroundService(notifServiceIntent);
+        } else {
+            UnityPlayer.currentContext.startService(notifServiceIntent);
+        }
+
+        isNotifServiceStarted = true;
+    }
+
+    private void stopNotificationService() {
+        if (!isNotifServiceStarted || notifServiceIntent == null) {
+            notifServiceIntent = null;
+            isNotifServiceStarted = false;
+            return;
+        }
+
+        UnityPlayer.currentContext.stopService(notifServiceIntent);
+        notifServiceIntent = null;
+        isNotifServiceStarted = false;
     }
 
     public ByteBuffer getByteBuffer() {
@@ -479,9 +588,17 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
         }
 
         public void release() {
+            CountDownLatch releaseLatch = new CountDownLatch(1);
             glHandler.post(() -> {
-                if (inputSurface != null) inputSurface.release();
-                if (inputSurfaceTexture != null) inputSurfaceTexture.release();
+                if (inputSurface != null) {
+                    inputSurface.release();
+                    inputSurface = null;
+                }
+                if (inputSurfaceTexture != null) {
+                    inputSurfaceTexture.setOnFrameAvailableListener(null);
+                    inputSurfaceTexture.release();
+                    inputSurfaceTexture = null;
+                }
                 
                 if (imageReaderEglSurface != EGL14.EGL_NO_SURFACE) {
                     EGL14.eglDestroySurface(eglDisplay, imageReaderEglSurface);
@@ -502,7 +619,14 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
                 EGL14.eglTerminate(eglDisplay);
 
                 glThread.quitSafely();
+                releaseLatch.countDown();
             });
+
+            try {
+                releaseLatch.await(500, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
         }
 
         @Override
