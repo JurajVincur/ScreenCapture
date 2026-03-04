@@ -265,6 +265,7 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
         Handler handler;
         byte[] spsPpsData = null;
         ByteBuffer formattedBuffer;
+        long bootTimeOffsetNs;
 
         void release() {
             if (codec != null) {
@@ -325,8 +326,7 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
                         }
 
                         boolean isKeyframe = (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
-                        long bootTimeOffsetMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime();
-                        long frameTimestampMs = bootTimeOffsetMs + (info.presentationTimeUs / 1000L);
+                        long frameTimestampMs = (state.bootTimeOffsetNs + info.presentationTimeUs * 1000L) / 1_000_000L;
 
                         int payloadSize = info.size;
                         if (isKeyframe && state.spsPpsData != null) {
@@ -369,6 +369,7 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             state.codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             state.surface = state.codec.createInputSurface();
             state.codec.start();
+            state.bootTimeOffsetNs = System.currentTimeMillis() * 1_000_000L - System.nanoTime();
         } catch (IOException e) {
             Log.e(TAG, "Failed to prepare " + threadName, e);
             state.release();
