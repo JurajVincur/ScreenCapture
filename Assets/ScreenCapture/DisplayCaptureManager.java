@@ -16,7 +16,6 @@ import android.media.ImageReader;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
-import android.media.MediaRecorder;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.opengl.EGL14;
@@ -36,10 +35,12 @@ import android.view.Surface;
 import com.unity3d.player.UnityPlayer;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 
 public class DisplayCaptureManager implements ImageReader.OnImageAvailableListener {
@@ -50,28 +51,26 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
     private Intent notifServiceIntent;
-
-    private MediaRecorder mediaRecorder;
-    private String videoFilePath;
-    private boolean isRecording = false;
     private SurfaceSplitter surfaceSplitter;
-    private boolean shouldRecordVideo = false;
 
+    private boolean shouldRecordVideo = false;
     private ByteBuffer byteBuffer;
-    
-    // --- NEW: MediaCodec properties ---
-    private MediaCodec mediaCodec;
-    private Surface mediaCodecSurface;
-    private HandlerThread codecThread;
-    private Handler codecHandler;
-    
-    // Buffers and tracking for Unity
+
+    // --- Unified Encoders ---
+    private EncoderState hrEncoder;
+    private EncoderState lrEncoder;
+
+    // File I/O for High-Quality stream
+    private FileOutputStream customVideoStream;
+    private FileChannel videoFileChannel;
+    private String videoFilePath;
+
+    // Buffers and tracking exposed to Unity
     private ByteBuffer h264Buffer;
     private long h264Timestamp;
     private int h264DataSize;
-	private boolean h264IsKeyframe;
-	private byte[] spsPpsData = null;
-    // ----------------------------------
+    private boolean h264IsKeyframe;
+    // -----------------------------
 
     private int width;
     private int height;
@@ -79,6 +78,10 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
     private UnityInterface unityInterface;
     private IUnityFrameListener frameListener = null;
     private BroadcastReceiver screenStateReceiver;
+
+    // Thread-safe state flags
+    private volatile boolean isCaptureActive = false;
+    private volatile boolean isDisposed = false;
 
     private record UnityInterface(String gameObjectName) {
 
@@ -108,8 +111,9 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
     }
 
     public static synchronized DisplayCaptureManager getInstance() {
-        if (instance == null)
+        if (instance == null) {
             instance = new DisplayCaptureManager();
+        }
 
         return instance;
     }
@@ -137,53 +141,50 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
 
             Log.i(TAG, "Starting screen capture and recording...");
 
-            // 1. Setup MediaRecorder FIRST
+            // 1. Setup High-Quality MediaCodec FIRST if requested
             if (shouldRecordVideo) {
-                setupMediaRecorder();
+                setupHqStream();
             }
-            
-            // --- NEW: Setup MediaCodec ---
-            setupMediaCodec();
 
-            // 2. Setup the OpenGL Surface Splitter (Now taking 3 surfaces)
+            // 2. Setup Low-Quality MediaCodec for Unity
+            setupLqStream();
+
+            // 3. Setup the OpenGL Surface Splitter
             surfaceSplitter = new SurfaceSplitter(
-                    reader.getSurface(), 
-                    mediaRecorder != null ? mediaRecorder.getSurface() : null,
-                    mediaCodecSurface, // <--- ADDED 3rd output
-                    width, 
-                    height
+                    width,
+                    height,
+                    reader.getSurface(),
+                    hrEncoder != null ? hrEncoder.surface : null,
+                    lrEncoder != null ? lrEncoder.surface : null
             );
 
             surfaceSplitter.setup(inputSurface -> {
-                // Callback fires when EGL is ready. Now create the Projection and VirtualDisplay.
-                var projectionManager = (MediaProjectionManager)
-                        UnityPlayer.currentContext.getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                // --- Prevent Zombie Capture ---
+                if (isDisposed) {
+                    Log.w(TAG, "GL Setup finished, but manager was already disposed. Aborting.");
+                    return;
+                }
+                // ------------------------------
+
+                var projectionManager = (MediaProjectionManager) UnityPlayer.currentContext.getSystemService(Context.MEDIA_PROJECTION_SERVICE);
                 projection = projectionManager.getMediaProjection(resultCode, intent);
 
                 projection.registerCallback(new MediaProjection.Callback() {
                     @Override
                     public void onStop() {
-                        Log.i(TAG, "Screen capture ended!");
+                        Log.i(TAG, "Screen capture ended via Projection Callback!");
                         handleScreenCaptureEnd();
                     }
                 }, new Handler(Looper.getMainLooper()));
 
-                // 3. Create a SINGLE VirtualDisplay pointing to the OpenGL input surface
+                // 4. Create a SINGLE VirtualDisplay pointing to the OpenGL input surface
                 virtualDisplay = projection.createVirtualDisplay("ScreenCapture",
                         width, height, 300,
                         DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                         inputSurface, null, null);
 
-                // 4. Start recording
-                if (mediaRecorder != null) {
-                    try {
-                        mediaRecorder.start();
-                        isRecording = true;
-                    } catch (IllegalStateException e) {
-                        Log.e(TAG, "Failed to start MediaRecorder", e);
-                    }
-                }
-
+                // Mark capture as active so cleanup can run when requested
+                isCaptureActive = true;
                 unityInterface.OnCaptureStarted();
             });
 
@@ -198,12 +199,10 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
                 @Override
                 public void onReceive(Context context, Intent intent) {
                     if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
-                        Log.i(TAG, "Screen turned off! Notifying Unity...");
                         if (unityInterface != null) {
                             unityInterface.OnScreenOff();
                         }
                     } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
-                        Log.i(TAG, "Screen turned on! Notifying Unity...");
                         if (unityInterface != null) {
                             unityInterface.OnScreenOn();
                         }
@@ -212,7 +211,7 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             };
             IntentFilter filter = new IntentFilter();
             filter.addAction(Intent.ACTION_SCREEN_OFF);
-            filter.addAction(Intent.ACTION_SCREEN_ON); // <-- Listen for Screen On
+            filter.addAction(Intent.ACTION_SCREEN_ON);
             UnityPlayer.currentContext.registerReceiver(screenStateReceiver, filter);
         }
     }
@@ -222,7 +221,6 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             try {
                 UnityPlayer.currentContext.unregisterReceiver(screenStateReceiver);
             } catch (IllegalArgumentException e) {
-                // Ignore: Receiver wasn't registered
             }
             screenStateReceiver = null;
         }
@@ -231,146 +229,216 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
     @Override
     public void onImageAvailable(ImageReader imageReader) {
         Image image = imageReader.acquireLatestImage();
+        if (image == null) {
+            return;
+        }
 
-        if (image == null) return;
-
-        ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-        buffer.rewind();
-
-        // Clear the buffer for new data by resetting the position of the buffer to zero
-        byteBuffer.clear();
-        byteBuffer.put(buffer);
-
-        long timestamp = image.getTimestamp();
-
-        image.close();
+        byteBuffer = image.getPlanes()[0].getBuffer();
 
         if (frameListener != null) {
             frameListener.OnNewFrameAvailable();
         }
+
+        byteBuffer = null;
+        image.close();
     }
 
-    private void setupMediaRecorder() {
-        try {
-            mediaRecorder = new MediaRecorder();
-            mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
-            mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+    // Helper function to write the 12-byte header (>ql)
+    private void write12ByteHeader(ByteBuffer buffer, long timestamp, int payloadSize) {
+        buffer.putLong(timestamp); // 8 bytes (q)
+        buffer.putInt(payloadSize); // 4 bytes (l)
+    }
 
-            File dir = UnityPlayer.currentContext.getExternalFilesDir(null);
-            videoFilePath = dir.getAbsolutePath() + "/capture_" + System.currentTimeMillis() + ".mp4";
-            
-            mediaRecorder.setOutputFile(videoFilePath);
-            mediaRecorder.setVideoSize(width, height);
-            mediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
-            mediaRecorder.setVideoEncodingBitRate(5000000); // 5 Mbps
-            mediaRecorder.setVideoFrameRate(30);
+    // =========================================================================================
+    // UNIFIED VIDEO ENCODER LOGIC
+    // =========================================================================================
+    private interface FrameOutputListener {
 
-            mediaRecorder.prepare();
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to prepare MediaRecorder", e);
-            mediaRecorder = null;
+        void onFrameReady(ByteBuffer formattedBuffer, long timestampMs, int totalSize, boolean isKeyframe);
+    }
+
+    private class EncoderState {
+
+        MediaCodec codec;
+        Surface surface;
+        HandlerThread thread;
+        Handler handler;
+        byte[] spsPpsData = null;
+        ByteBuffer formattedBuffer;
+
+        void release() {
+            if (codec != null) {
+                try {
+                    codec.setCallback(null);
+                    codec.stop();
+                    codec.release();
+                } catch (Exception e) {
+                }
+                codec = null;
+            }
+            if (surface != null) {
+                surface.release();
+                surface = null;
+            }
+            if (thread != null) {
+                thread.quitSafely();
+                thread = null;
+            }
+            handler = null;
+            spsPpsData = null;
         }
     }
-    
-    // --- NEW: MediaCodec setup method ---
-    private void setupMediaCodec() {
+
+    private EncoderState createVideoEncoder(int bitRate, int frameRate, String threadName, FrameOutputListener outputListener) {
+        EncoderState state = new EncoderState();
         try {
             MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-            format.setInteger(MediaFormat.KEY_BIT_RATE, 1000000); // Low Bitrate (1 Mbps)
-            format.setInteger(MediaFormat.KEY_FRAME_RATE, 10);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate);
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
 
-            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-            
-            // Run codec callbacks on a separate thread to prevent blocking main/EGL
-            codecThread = new HandlerThread("MediaCodecThread");
-            codecThread.start();
-            codecHandler = new Handler(codecThread.getLooper());
+            state.codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
 
-            mediaCodec.setCallback(new MediaCodec.Callback() {
+            state.thread = new HandlerThread(threadName);
+            state.thread.start();
+            state.handler = new Handler(state.thread.getLooper());
+
+            state.codec.setCallback(new MediaCodec.Callback() {
                 @Override
-                public void onInputBufferAvailable(MediaCodec codec, int index) { }
+                public void onInputBufferAvailable(MediaCodec codec, int index) {
+                }
 
                 @Override
                 public void onOutputBufferAvailable(MediaCodec codec, int index, MediaCodec.BufferInfo info) {
                     ByteBuffer outputBuffer = codec.getOutputBuffer(index);
                     if (outputBuffer != null && info.size > 0) {
-                        
-                        // 1. Intercept the SPS/PPS Config Buffer
+
+                        // 1. Intercept SPS/PPS
                         if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                            spsPpsData = new byte[info.size];
+                            state.spsPpsData = new byte[info.size];
                             outputBuffer.position(info.offset);
                             outputBuffer.limit(info.offset + info.size);
-                            outputBuffer.get(spsPpsData);
-
-							Log.i(TAG, "SPS PPS DATA RECEIVED");
-                            
-                            // Release and return. This isn't a video frame, so don't send to Unity yet.
+                            outputBuffer.get(state.spsPpsData);
                             codec.releaseOutputBuffer(index, false);
-                            return; 
+                            return;
                         }
 
-                        h264IsKeyframe = (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
+                        boolean isKeyframe = (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
+                        long bootTimeOffsetMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime();
+                        long frameTimestampMs = bootTimeOffsetMs + (info.presentationTimeUs / 1000L);
 
-                        // 2. Calculate total size (Keyframe size + SPS/PPS size)
-                        int totalSize = info.size;
-                        if (h264IsKeyframe && spsPpsData != null) {
-                            totalSize += spsPpsData.length;
+                        int payloadSize = info.size;
+                        if (isKeyframe && state.spsPpsData != null) {
+                            payloadSize += state.spsPpsData.length;
                         }
 
-                        // 3. Dynamically allocate or expand buffer if needed
-                        if (h264Buffer == null || h264Buffer.capacity() < totalSize) {
-                            h264Buffer = ByteBuffer.allocateDirect(totalSize);
-                        }
-                        
-                        h264Buffer.clear();
-                        
-                        // 4. If it's a keyframe, prepend the SPS/PPS data first
-                        if (h264IsKeyframe && spsPpsData != null) {
-                            h264Buffer.put(spsPpsData);
+                        int totalBufferSize = 12 + payloadSize;
+                        if (state.formattedBuffer == null || state.formattedBuffer.capacity() < totalBufferSize) {
+                            state.formattedBuffer = ByteBuffer.allocateDirect(totalBufferSize);
                         }
 
-                        // 5. Append the actual frame data
+                        state.formattedBuffer.clear();
+                        write12ByteHeader(state.formattedBuffer, frameTimestampMs, payloadSize);
+
+                        if (isKeyframe && state.spsPpsData != null) {
+                            state.formattedBuffer.put(state.spsPpsData);
+                        }
+
                         outputBuffer.position(info.offset);
                         outputBuffer.limit(info.offset + info.size);
-                        h264Buffer.put(outputBuffer);
-                        h264Buffer.flip();
-                        
-                        // 6. Store metadata for Unity
-                        h264DataSize = totalSize;
-                        long bootTimeOffsetMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime();
-                        h264Timestamp = bootTimeOffsetMs + info.presentationTimeUs / 1000L;
+                        state.formattedBuffer.put(outputBuffer);
+                        state.formattedBuffer.flip();
 
-                        if (frameListener != null) {
-                            frameListener.OnNewH264DataAvailable();
-                        }
+                        // 2. Trigger the callback logic defined for this specific stream
+                        outputListener.onFrameReady(state.formattedBuffer, frameTimestampMs, totalBufferSize, isKeyframe);
                     }
                     codec.releaseOutputBuffer(index, false);
                 }
 
                 @Override
                 public void onError(MediaCodec codec, MediaCodec.CodecException e) {
-                    Log.e(TAG, "MediaCodec Error", e);
+                    Log.e(TAG, threadName + " Error", e);
                 }
 
                 @Override
-                public void onOutputFormatChanged(MediaCodec codec, MediaFormat format) { }
-            }, codecHandler);
+                public void onOutputFormatChanged(MediaCodec codec, MediaFormat format) {
+                }
+            }, state.handler);
 
-            mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            mediaCodecSurface = mediaCodec.createInputSurface();
-            mediaCodec.start();
+            state.codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            state.surface = state.codec.createInputSurface();
+            state.codec.start();
         } catch (IOException e) {
-            Log.e(TAG, "Failed to prepare MediaCodec", e);
-            mediaCodec = null;
-            mediaCodecSurface = null;
+            Log.e(TAG, "Failed to prepare " + threadName, e);
+            state.release();
+            return null;
         }
+        return state;
     }
 
-    private void handleScreenCaptureEnd() {
+    // =========================================================================================
+    private void setupHqStream() {
+        try {
+            File dir = UnityPlayer.currentContext.getExternalFilesDir(null);
+            videoFilePath = dir.getAbsolutePath() + "/capture_" + System.currentTimeMillis() + ".bin";
+            customVideoStream = new FileOutputStream(videoFilePath);
+            videoFileChannel = customVideoStream.getChannel();
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to create Binary file", e);
+        }
+
+        // Setup 5Mbps, 30FPS stream pointing to the FileChannel
+        hrEncoder = createVideoEncoder(5000000, 30, "HqMediaCodecThread",
+                (formattedBuffer, timestampMs, totalSize, isKeyframe) -> {
+                    if (videoFileChannel != null) {
+                        try {
+                            while (formattedBuffer.hasRemaining()) {
+                                videoFileChannel.write(formattedBuffer);
+                            }
+                        } catch (IOException e) {
+                            Log.e(TAG, "Failed to write high-quality frame to disk", e);
+                        }
+                    }
+                }
+        );
+    }
+
+    private void setupLqStream() {
+        // Setup 1Mbps, 10FPS stream pointing to the Unity Variables
+        lrEncoder = createVideoEncoder(1000000, 10, "MediaCodecThread",
+                (formattedBuffer, timestampMs, totalSize, isKeyframe) -> {
+                    h264Buffer = formattedBuffer;
+                    h264Timestamp = timestampMs;
+                    h264DataSize = totalSize;
+                    h264IsKeyframe = isKeyframe;
+
+                    if (frameListener != null) {
+                        frameListener.OnNewH264DataAvailable();
+                    }
+                }
+        );
+    }
+
+    // Synchronized lock to ensure it runs completely safely even if called
+    // simultaneously from Unity thread and Projection thread
+    private synchronized void handleScreenCaptureEnd() {
+
+        // --- Execution Check ---
+        if (!isCaptureActive) {
+            return;
+        }
+        isCaptureActive = false;
+        // -----------------------
 
         unregisterScreenStateReceiver();
+
+        // --- Actually stop the OS-level projection service ---
+        if (projection != null) {
+            projection.stop();
+            projection = null;
+        }
+        // -----------------------------------------------------
 
         if (virtualDisplay != null) {
             virtualDisplay.release();
@@ -382,95 +450,93 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             surfaceSplitter = null;
         }
 
-        if (isRecording && mediaRecorder != null) {
-            try {
-                mediaRecorder.stop();
-                mediaRecorder.reset();
-                mediaRecorder.release();
-                mediaRecorder = null;
-                isRecording = false;
-                Log.i(TAG, "Recording successfully saved to: " + videoFilePath);
-            } catch (RuntimeException stopException) {
-                Log.e(TAG, "Failed to stop MediaRecorder cleanly", stopException);
-            }
+        // Cleanup Encoders
+        if (hrEncoder != null) {
+            hrEncoder.release();
+            hrEncoder = null;
+            Log.i(TAG, "High-Quality Binary stream successfully saved to: " + videoFilePath);
         }
-        
-        // --- NEW: Cleanup MediaCodec ---
-        if (mediaCodec != null) {
-            try {
-                mediaCodec.stop();
-                mediaCodec.release();
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to stop MediaCodec", e);
-            }
-            mediaCodec = null;
-            mediaCodecSurface = null;
-            spsPpsData = null;
+
+        if (lrEncoder != null) {
+            lrEncoder.release();
+            lrEncoder = null;
         }
-        if (codecThread != null) {
-            codecThread.quitSafely();
-            codecThread = null;
-            codecHandler = null;
+
+        // Cleanup File Streams
+        if (videoFileChannel != null) {
+            try {
+                videoFileChannel.close();
+                customVideoStream.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Failed to close High-Quality file streams", e);
+            }
+            videoFileChannel = null;
+            customVideoStream = null;
         }
 
         UnityPlayer.currentContext.stopService(notifServiceIntent);
-        unityInterface.OnCaptureStopped();
+
+        if (unityInterface != null) {
+            unityInterface.OnCaptureStopped();
+        }
     }
 
     // Called by Unity
     public void setup(String gameObjectName, int width, int height) {
-
         unityInterface = new UnityInterface(gameObjectName);
-
         this.width = width;
         this.height = height;
 
-        // Calculate the exact buffer size required (4 bytes per pixel for RGBA_8888)
         int bufferSize = width * height * 4;
-
-        // Allocate a direct ByteBuffer for better performance
-        byteBuffer = ByteBuffer.allocateDirect(bufferSize);
-
         reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
-
         reader.setOnImageAvailableListener(this, new Handler(Looper.getMainLooper()));
     }
 
     public void requestCapture(boolean recordVideo) {
         this.shouldRecordVideo = recordVideo;
-        
-        Log.i(TAG, "Asking for screen capture permission...");
-        Intent intent = new Intent(
-                UnityPlayer.currentActivity,
-                DisplayCaptureRequestActivity.class);
+        Intent intent = new Intent(UnityPlayer.currentActivity, DisplayCaptureRequestActivity.class);
         UnityPlayer.currentActivity.startActivity(intent);
     }
 
     public void stopCapture() {
-        Log.i(TAG, "Stopping screen capture...");
+        if (projection == null) {
+            return;
+        }
+        projection.stop(); // This triggers the onStop() callback which calls handleScreenCaptureEnd()
+    }
 
-        if(projection == null) return;
-        projection.stop();
+    public void dispose() {
+        isDisposed = true; // Mark as disposed to prevent async setup from continuing
+        handleScreenCaptureEnd();
+
+        if (reader != null) {
+            reader.close();
+            reader = null;
+        }
+        byteBuffer = null;
+        unityInterface = null;
+        instance = null;
+
+        Log.i(TAG, "DisplayCaptureManager disposed.");
     }
 
     public ByteBuffer getByteBuffer() {
         return byteBuffer;
     }
-    
-    // --- NEW: Getters for Unity to retrieve the encoded H264 data ---
+
     public ByteBuffer getH264Buffer() {
         return h264Buffer;
     }
 
     public long getH264Timestamp() {
-        return h264Timestamp; // in microseconds
+        return h264Timestamp;
     }
-    
+
     public int getH264DataSize() {
         return h264DataSize;
     }
 
-	public boolean getH264IsKeyframe() {
+    public boolean getH264IsKeyframe() {
         return h264IsKeyframe;
     }
 
@@ -478,20 +544,17 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
     // OpenGL Surface Splitter
     // =========================================================================================
     private static class SurfaceSplitter implements SurfaceTexture.OnFrameAvailableListener {
-        
+
         private HandlerThread glThread;
         private Handler glHandler;
 
         private EGLDisplay eglDisplay = EGL14.EGL_NO_DISPLAY;
         private EGLContext eglContext = EGL14.EGL_NO_CONTEXT;
-        private EGLSurface imageReaderEglSurface = EGL14.EGL_NO_SURFACE;
-        private EGLSurface mediaRecorderEglSurface = EGL14.EGL_NO_SURFACE;
-        private EGLSurface mediaCodecEglSurface = EGL14.EGL_NO_SURFACE; // <--- NEW
 
-        private Surface imageReaderSurface;
-        private Surface mediaRecorderSurface;
-        private Surface mediaCodecSurface; // <--- NEW
-        
+        // --- Dynamic lists replace hardcoded surfaces ---
+        private final ArrayList<Surface> targetSurfaces = new ArrayList<>();
+        private final ArrayList<EGLSurface> eglSurfaces = new ArrayList<>();
+
         private SurfaceTexture inputSurfaceTexture;
         private Surface inputSurface;
         private int textureId;
@@ -506,16 +569,20 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
         private float[] transformMatrix = new float[16];
 
         public interface OnSetupCompleteListener {
+
             void onSetupComplete(Surface inputSurface);
         }
 
-        // --- UPDATED: Pass 3rd Surface ---
-        public SurfaceSplitter(Surface imageReaderSurface, Surface mediaRecorderSurface, Surface mediaCodecSurface, int width, int height) {
-            this.imageReaderSurface = imageReaderSurface;
-            this.mediaRecorderSurface = mediaRecorderSurface;
-            this.mediaCodecSurface = mediaCodecSurface; // <--- NEW
+        // Accepts a dynamic number of outputs (varargs)
+        public SurfaceSplitter(int width, int height, Surface... surfaces) {
             this.width = width;
             this.height = height;
+
+            for (Surface s : surfaces) {
+                if (s != null) {
+                    this.targetSurfaces.add(s);
+                }
+            }
 
             glThread = new HandlerThread("GLSplitterThread");
             glThread.start();
@@ -532,26 +599,40 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
 
         public void release() {
             glHandler.post(() -> {
-                if (inputSurface != null) inputSurface.release();
-                if (inputSurfaceTexture != null) inputSurfaceTexture.release();
-                
-                if (imageReaderEglSurface != EGL14.EGL_NO_SURFACE) {
-                    EGL14.eglDestroySurface(eglDisplay, imageReaderEglSurface);
+                // --- VRAM Leak Fix ---
+                if (textureId != 0) {
+                    GLES20.glDeleteTextures(1, new int[]{textureId}, 0);
+                    textureId = 0;
                 }
-                if (mediaRecorderEglSurface != EGL14.EGL_NO_SURFACE) {
-                    EGL14.eglDestroySurface(eglDisplay, mediaRecorderEglSurface);
+                if (shaderProgram != 0) {
+                    GLES20.glDeleteProgram(shaderProgram);
+                    shaderProgram = 0;
                 }
-                // --- NEW: Cleanup 3rd EGL Surface ---
-                if (mediaCodecEglSurface != EGL14.EGL_NO_SURFACE) {
-                    EGL14.eglDestroySurface(eglDisplay, mediaCodecEglSurface);
+                // ---------------------
+
+                if (inputSurface != null) {
+                    inputSurface.release();
                 }
-                
+                if (inputSurfaceTexture != null) {
+                    inputSurfaceTexture.release();
+                }
+
+                // Dynamically destroy all surfaces
+                for (EGLSurface eglSurface : eglSurfaces) {
+                    EGL14.eglDestroySurface(eglDisplay, eglSurface);
+                }
+                eglSurfaces.clear();
+
                 if (eglContext != EGL14.EGL_NO_CONTEXT) {
                     EGL14.eglDestroyContext(eglDisplay, eglContext);
+                    eglContext = EGL14.EGL_NO_CONTEXT;
                 }
-                
+
                 EGL14.eglReleaseThread();
-                EGL14.eglTerminate(eglDisplay);
+                if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                    EGL14.eglTerminate(eglDisplay);
+                    eglDisplay = EGL14.EGL_NO_DISPLAY;
+                }
 
                 glThread.quitSafely();
             });
@@ -564,27 +645,12 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
                 surfaceTexture.getTransformMatrix(transformMatrix);
                 long timestampNs = surfaceTexture.getTimestamp();
 
-                // Draw to ImageReader Surface
-                if (imageReaderEglSurface != EGL14.EGL_NO_SURFACE) {
-                    EGL14.eglMakeCurrent(eglDisplay, imageReaderEglSurface, imageReaderEglSurface, eglContext);
+                // Dynamically draw to all connected surfaces!
+                for (EGLSurface eglSurface : eglSurfaces) {
+                    EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
                     drawFrame();
-                    EGL14.eglSwapBuffers(eglDisplay, imageReaderEglSurface);
-                }
-
-                // Draw to MediaRecorder Surface
-                if (mediaRecorderEglSurface != EGL14.EGL_NO_SURFACE && mediaRecorderSurface != null) {
-                    EGL14.eglMakeCurrent(eglDisplay, mediaRecorderEglSurface, mediaRecorderEglSurface, eglContext);
-                    drawFrame();
-                    EGLExt.eglPresentationTimeANDROID(eglDisplay, mediaRecorderEglSurface, timestampNs);
-                    EGL14.eglSwapBuffers(eglDisplay, mediaRecorderEglSurface);
-                }
-                
-                // --- NEW: Draw to MediaCodec Surface ---
-                if (mediaCodecEglSurface != EGL14.EGL_NO_SURFACE && mediaCodecSurface != null) {
-                    EGL14.eglMakeCurrent(eglDisplay, mediaCodecEglSurface, mediaCodecEglSurface, eglContext);
-                    drawFrame();
-                    EGLExt.eglPresentationTimeANDROID(eglDisplay, mediaCodecEglSurface, timestampNs);
-                    EGL14.eglSwapBuffers(eglDisplay, mediaCodecEglSurface);
+                    EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, timestampNs);
+                    EGL14.eglSwapBuffers(eglDisplay, eglSurface);
                 }
             });
         }
@@ -595,40 +661,26 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             EGL14.eglInitialize(eglDisplay, version, 0, version, 1);
 
             int[] attribList = {
-                    EGL14.EGL_RED_SIZE, 8,
-                    EGL14.EGL_GREEN_SIZE, 8,
-                    EGL14.EGL_BLUE_SIZE, 8,
-                    EGL14.EGL_ALPHA_SIZE, 8,
-                    EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-                    0x3142, 1, // EGL_RECORDABLE_ANDROID
-                    EGL14.EGL_NONE
+                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT, 0x3142, 1, EGL14.EGL_NONE
             };
             EGLConfig[] configs = new EGLConfig[1];
             int[] numConfigs = new int[1];
             EGL14.eglChooseConfig(eglDisplay, attribList, 0, configs, 0, configs.length, numConfigs, 0);
 
-            int[] contextAttribs = { EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE };
+            int[] contextAttribs = {EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE};
             eglContext = EGL14.eglCreateContext(eglDisplay, configs[0], EGL14.EGL_NO_CONTEXT, contextAttribs, 0);
 
-            int[] surfaceAttribs = { EGL14.EGL_NONE };
-            if (imageReaderSurface != null) {
-                imageReaderEglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], imageReaderSurface, surfaceAttribs, 0);
-            }
-            if (mediaRecorderSurface != null) {
-                mediaRecorderEglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], mediaRecorderSurface, surfaceAttribs, 0);
-            }
-            // --- NEW: Init 3rd EGL Surface ---
-            if (mediaCodecSurface != null) {
-                mediaCodecEglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], mediaCodecSurface, surfaceAttribs, 0);
+            int[] surfaceAttribs = {EGL14.EGL_NONE};
+
+            // Dynamically create EGL layers
+            for (Surface target : targetSurfaces) {
+                EGLSurface eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], target, surfaceAttribs, 0);
+                eglSurfaces.add(eglSurface);
             }
 
-            // Bind an initial context
-            if (imageReaderEglSurface != EGL14.EGL_NO_SURFACE) {
-                EGL14.eglMakeCurrent(eglDisplay, imageReaderEglSurface, imageReaderEglSurface, eglContext);
-            } else if (mediaRecorderEglSurface != EGL14.EGL_NO_SURFACE) {
-                EGL14.eglMakeCurrent(eglDisplay, mediaRecorderEglSurface, mediaRecorderEglSurface, eglContext);
-            } else if (mediaCodecEglSurface != EGL14.EGL_NO_SURFACE) {
-                EGL14.eglMakeCurrent(eglDisplay, mediaCodecEglSurface, mediaCodecEglSurface, eglContext);
+            if (!eglSurfaces.isEmpty()) {
+                EGL14.eglMakeCurrent(eglDisplay, eglSurfaces.get(0), eglSurfaces.get(0), eglContext);
             }
         }
 
@@ -643,27 +695,26 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
 
             inputSurfaceTexture = new SurfaceTexture(textureId);
-            // CRITICAL FIX: Tell the off-screen surface how big it needs to be!
             inputSurfaceTexture.setDefaultBufferSize(width, height);
             inputSurfaceTexture.setOnFrameAvailableListener(this, glHandler);
             inputSurface = new Surface(inputSurfaceTexture);
 
-            String vertexShader = "attribute vec4 aPosition;\n" +
-                    "attribute vec4 aTexCoord;\n" +
-                    "varying vec2 vTexCoord;\n" +
-                    "uniform mat4 uMatrix;\n" +
-                    "void main() {\n" +
-                    "    gl_Position = aPosition;\n" +
-                    "    vTexCoord = (uMatrix * aTexCoord).xy;\n" +
-                    "}";
+            String vertexShader = "attribute vec4 aPosition;\n"
+                    + "attribute vec4 aTexCoord;\n"
+                    + "varying vec2 vTexCoord;\n"
+                    + "uniform mat4 uMatrix;\n"
+                    + "void main() {\n"
+                    + "    gl_Position = aPosition;\n"
+                    + "    vTexCoord = (uMatrix * aTexCoord).xy;\n"
+                    + "}";
 
-            String fragmentShader = "#extension GL_OES_EGL_image_external : require\n" +
-                    "precision mediump float;\n" +
-                    "varying vec2 vTexCoord;\n" +
-                    "uniform samplerExternalOES sTexture;\n" +
-                    "void main() {\n" +
-                    "    gl_FragColor = texture2D(sTexture, vTexCoord);\n" +
-                    "}";
+            String fragmentShader = "#extension GL_OES_EGL_image_external : require\n"
+                    + "precision mediump float;\n"
+                    + "varying vec2 vTexCoord;\n"
+                    + "uniform samplerExternalOES sTexture;\n"
+                    + "void main() {\n"
+                    + "    gl_FragColor = texture2D(sTexture, vTexCoord);\n"
+                    + "}";
 
             shaderProgram = GLES20.glCreateProgram();
             int vShader = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER);
@@ -677,8 +728,8 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
             GLES20.glAttachShader(shaderProgram, fShader);
             GLES20.glLinkProgram(shaderProgram);
 
-            float[] coords = { -1f, -1f,  1f, -1f,  -1f, 1f,  1f, 1f };
-            float[] texs = { 0f, 0f,  1f, 0f,  0f, 1f,  1f, 1f };
+            float[] coords = {-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f};
+            float[] texs = {0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f};
 
             vertexBuffer = ByteBuffer.allocateDirect(coords.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().put(coords);
             vertexBuffer.position(0);
@@ -687,16 +738,13 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
         }
 
         private void drawFrame() {
-            // CRITICAL FIX: Explicitly set the rendering viewport to the screen dimensions
             GLES20.glViewport(0, 0, width, height);
-            
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
             GLES20.glUseProgram(shaderProgram);
 
-            // Explicitly activate and bind the OES texture
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId);
-            
+
             int samplerLoc = GLES20.glGetUniformLocation(shaderProgram, "sTexture");
             GLES20.glUniform1i(samplerLoc, 0);
 

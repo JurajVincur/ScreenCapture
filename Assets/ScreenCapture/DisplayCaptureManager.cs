@@ -40,7 +40,6 @@ namespace PupilLabs.ScreenCapture
         public byte[] LatestFrame { get; private set; }
         // ---------------------------------
 
-        private unsafe sbyte* imageData;
         private int bufferSize;
         private volatile bool newFrameReceived = false;
         private readonly object frameLock = new object();
@@ -98,6 +97,7 @@ namespace PupilLabs.ScreenCapture
                 if (androidInstance != null)
                 {
                     SetFrameListener(null);
+                    androidInstance.Call("dispose");
                     androidInstance.Dispose();
                     androidInstance = null;
                 }
@@ -142,12 +142,17 @@ namespace PupilLabs.ScreenCapture
 
         public void StartScreenCapture()
         {
+            if (captureActive == true)
+            {
+                StopScreenCapture();
+            }
             captureActive = true;
             androidInterface.RequestCapture(recordVideo);
         }
 
         public void StopScreenCapture()
         {
+            if (!captureActive) return;
             captureActive = false;
             androidInterface.StopCapture();
         }
@@ -176,7 +181,6 @@ namespace PupilLabs.ScreenCapture
         private unsafe void OnCaptureStarted()
         {
             onStarted.Invoke();
-            imageData = androidInterface.GetByteBuffer();
         }
 
         private void OnPermissionDenied()
@@ -207,6 +211,7 @@ namespace PupilLabs.ScreenCapture
 
         internal unsafe void OnNewFrame(object sender, EventArgs e) //TODO
         {
+            sbyte* imageData = androidInterface.GetByteBuffer();
             if (imageData == null) return;
 
             lock (frameLock)

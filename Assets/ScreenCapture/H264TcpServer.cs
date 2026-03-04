@@ -1,11 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
-using System.Buffers; // <--- NEW: For ArrayPool
+using System.Buffers;
 using UnityEngine;
-using System.Buffers.Binary;
 
 namespace PupilLabs.ScreenCapture
 {
@@ -13,21 +13,38 @@ namespace PupilLabs.ScreenCapture
     {
         [Header("Server Settings")]
         public int port = 8080;
-        public int sendTimeoutMs = 1000; // <--- NEW: 1 second timeout for slow clients
+        public int sendTimeoutMs = 1000;
 
         private DisplayCaptureManager captureManager;
         private TcpListener tcpListener;
         private Thread listenThread;
-        private bool isServerRunning;
+        private volatile bool isServerRunning;
 
-        private static readonly ThreadLocal<byte[]> headerBuffer = new ThreadLocal<byte[]>(() => new byte[12]);
         private List<TcpClient> connectedClients = new List<TcpClient>();
         private readonly object clientsLock = new object();
+
+        private ConcurrentQueue<(byte[] Data, int Size)> frameQueue;
+        private AutoResetEvent frameAddedSignal;
+        private Thread senderThread;
+        private volatile bool isSenderRunning;
 
         private void Start()
         {
             captureManager = DisplayCaptureManager.Instance;
             captureManager.onNewH264Data += OnNewH264FrameReady;
+
+            // Initialize our queue and synchronization signal
+            frameQueue = new ConcurrentQueue<(byte[] Data, int Size)>();
+            frameAddedSignal = new AutoResetEvent(false);
+            isSenderRunning = true;
+
+            // Start the dedicated sender thread
+            senderThread = new Thread(SendLoop)
+            {
+                IsBackground = true,
+                Name = "H264_TCP_Sender_Thread"
+            };
+            senderThread.Start();
 
             StartServer();
         }
@@ -63,10 +80,9 @@ namespace PupilLabs.ScreenCapture
                 {
                     TcpClient client = tcpListener.AcceptTcpClient();
 
-                    // Optional: Tune socket parameters for video streaming
-                    client.NoDelay = true; // Disable Nagle's algorithm for lower latency
-                    client.SendBufferSize = 1024 * 1024; // 1MB buffer
-                    client.SendTimeout = sendTimeoutMs;  // <--- CRITICAL: Drop slow clients
+                    client.NoDelay = true;
+                    client.SendBufferSize = 1024 * 1024;
+                    client.SendTimeout = sendTimeoutMs;
 
                     lock (clientsLock)
                     {
@@ -77,7 +93,6 @@ namespace PupilLabs.ScreenCapture
                 }
                 catch (SocketException)
                 {
-                    // Expected when tcpListener.Stop() is called
                     break;
                 }
             }
@@ -91,25 +106,43 @@ namespace PupilLabs.ScreenCapture
             }
 
             int size = captureManager.LatestH264Size;
-            long timestamp = captureManager.LatestH264Timestamp;
-            bool isKeyframe = captureManager.LatestH264IsKeyframe;
 
-            // --- FIXED: Rent a reusable array instead of allocating a new one ---
             byte[] rentedArray = ArrayPool<byte>.Shared.Rent(size);
             Buffer.BlockCopy(captureManager.LatestH264Data, 0, rentedArray, 0, size);
 
-            // Offload the network writing
-            ThreadPool.QueueUserWorkItem(_ => SendToClients(rentedArray, size, timestamp, isKeyframe));
+            while (frameQueue.Count >= 5)
+            {
+                if (frameQueue.TryDequeue(out var droppedFrame))
+                {
+                    ArrayPool<byte>.Shared.Return(droppedFrame.Data);
+                }
+            }
+
+            // Enqueue the new frame and wake up the sender thread
+            frameQueue.Enqueue((rentedArray, size));
+            frameAddedSignal.Set();
         }
 
-        private void SendToClients(byte[] data, int size, long timestamp, bool isKeyframe)
+        private void SendLoop()
+        {
+            while (isSenderRunning)
+            {
+                // Put the thread to sleep until frameAddedSignal.Set() is called.
+                // It will wake up instantly when a frame arrives.
+                frameAddedSignal.WaitOne();
+
+                // Dequeue and send all available frames
+                while (frameQueue.TryDequeue(out var frame))
+                {
+                    SendToClients(frame.Data, frame.Size);
+                }
+            }
+        }
+
+        private void SendToClients(byte[] data, int size)
         {
             try
             {
-                byte[] header = headerBuffer.Value;
-                BinaryPrimitives.WriteInt64BigEndian(header.AsSpan(0, 8), timestamp);
-                BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(8, 4), size);
-
                 lock (clientsLock)
                 {
                     for (int i = connectedClients.Count - 1; i >= 0; i--)
@@ -118,10 +151,9 @@ namespace PupilLabs.ScreenCapture
                         try
                         {
                             NetworkStream stream = client.GetStream();
-                            stream.Write(header, 0, header.Length);
                             stream.Write(data, 0, size);
                         }
-                        catch (Exception e) // Will catch SendTimeout exceptions
+                        catch (Exception e)
                         {
                             Debug.LogWarning($"[H264TcpServer] Client disconnected or timed out: {e.Message}");
                             client.Close();
@@ -132,7 +164,7 @@ namespace PupilLabs.ScreenCapture
             }
             finally
             {
-                // --- FIXED: Always return the array to the pool when finished sending ---
+                // Always return the array to the pool!
                 ArrayPool<byte>.Shared.Return(data);
             }
         }
@@ -140,17 +172,22 @@ namespace PupilLabs.ScreenCapture
         private void OnDestroy()
         {
             isServerRunning = false;
+            isSenderRunning = false;
 
             if (captureManager != null)
             {
                 captureManager.onNewH264Data -= OnNewH264FrameReady;
             }
 
+            // Wake up the sender thread one last time so it can exit the while loop safely
+            frameAddedSignal?.Set();
+
             if (tcpListener != null)
             {
                 tcpListener.Stop();
             }
 
+            // Clean up clients
             lock (clientsLock)
             {
                 foreach (var client in connectedClients)
@@ -159,6 +196,17 @@ namespace PupilLabs.ScreenCapture
                 }
                 connectedClients.Clear();
             }
+
+            // Empty the queue and return any unsent frames to the pool to prevent leaks
+            if (frameQueue != null)
+            {
+                while (frameQueue.TryDequeue(out var unreadFrame))
+                {
+                    ArrayPool<byte>.Shared.Return(unreadFrame.Data);
+                }
+            }
+
+            frameAddedSignal?.Dispose();
         }
     }
 }
