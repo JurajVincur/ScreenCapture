@@ -339,7 +339,8 @@ public class DisplayCaptureManager implements ImageReader.OnImageAvailableListen
                         
                         // 6. Store metadata for Unity
                         h264DataSize = totalSize;
-                        h264Timestamp = System.currentTimeMillis();//info.presentationTimeUs;
+                        long bootTimeOffsetMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime();
+                        h264Timestamp = bootTimeOffsetMs + info.presentationTimeUs / 1000L;
 
                         if (frameListener != null) {
                             frameListener.OnNewH264DataAvailable();
